@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+bserve - HTTP-in-Binary Server Implementation (Track 1)
+
+Usage:
+  ./bserve [doc_root] [port]
+  Defaults: ./www 9000
+"""
+
+import sys
+import os
+import socket
+import threading
+import mimetypes
+
+# Add local package directory to sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bproto import (
+    FRAME_TYPE_HEADERS,
+    FRAME_TYPE_DATA,
+    FLAG_NONE,
+    FLAG_END_STREAM,
+    FLAG_END_HEADERS,
+    STATUS_OK,
+    STATUS_BAD_REQUEST,
+    STATUS_NOT_FOUND,
+    STATUS_INTERNAL_ERROR,
+    STATUS_MESSAGES,
+    Frame,
+    read_frame,
+    write_frame,
+    encode_headers,
+    decode_headers,
+)
+from bproto.utils import sanitize_path
+
+
+def send_error_response(sock, stream_id: int, status_code: int, message: str = ""):
+    """Helper to send a 400/404/500 binary error response."""
+    phrase = STATUS_MESSAGES.get(status_code, "Error")
+    body_text = f"{status_code} {phrase}: {message}\n" if message else f"{status_code} {phrase}\n"
+    body_bytes = body_text.encode("utf-8")
+
+    res_headers = [
+        (":status", str(status_code)),
+        ("content-type", "text/plain; charset=utf-8"),
+        ("content-length", str(len(body_bytes))),
+        ("server", "bserve/1.0"),
+    ]
+
+    encoded_hdr = encode_headers(res_headers)
+    headers_frame = Frame(
+        type_=FRAME_TYPE_HEADERS,
+        flags=FLAG_END_HEADERS,
+        stream_id=stream_id,
+        payload=encoded_hdr,
+    )
+    data_frame = Frame(
+        type_=FRAME_TYPE_DATA,
+        flags=FLAG_END_STREAM,
+        stream_id=stream_id,
+        payload=body_bytes,
+    )
+
+    write_frame(sock, headers_frame)
+    write_frame(sock, data_frame)
+
+
+def handle_client(sock: socket.socket, addr, doc_root: str):
+    """Handle persistent TCP connection from a client."""
+    print(f"[*] Connection accepted from {addr[0]}:{addr[1]}")
+    try:
+        while True:
+            try:
+                frame = read_frame(sock, skip_unknown=True)
+            except Exception as e:
+                print(f"[!] Malformed frame or socket read error from {addr}: {e}")
+                # If socket is still open, try sending 400 Bad Request
+                try:
+                    send_error_response(sock, stream_id=1, status_code=STATUS_BAD_REQUEST, message="Malformed binary frame")
+                except Exception:
+                    pass
+                break
+
+            if frame is None:
+                # Client closed connection gracefully
+                print(f"[*] Client {addr[0]}:{addr[1]} disconnected cleanly.")
+                break
+
+            # Validate frame type
+            if frame.type != FRAME_TYPE_HEADERS:
+                print(f"[!] Expected HEADERS frame, received frame type {frame.type_name}")
+                send_error_response(sock, stream_id=frame.stream_id, status_code=STATUS_BAD_REQUEST, message="Expected HEADERS frame")
+                continue
+
+            # Decode request headers
+            try:
+                headers = decode_headers(frame.payload)
+                hdr_dict = {k.lower(): v for k, v in headers}
+            except Exception as e:
+                print(f"[!] Header decoding error: {e}")
+                send_error_response(sock, stream_id=frame.stream_id, status_code=STATUS_BAD_REQUEST, message="Header decoding failed")
+                continue
+
+            # Extract request path (:path pseudo-header)
+            req_path = hdr_dict.get(":path")
+            req_method = hdr_dict.get(":method", "GET")
+
+            if not req_path:
+                print("[!] Missing :path header in request frame")
+                send_error_response(sock, stream_id=frame.stream_id, status_code=STATUS_BAD_REQUEST, message="Missing :path header")
+                continue
+
+            print(f"[*] Request: {req_method} {req_path} (Stream {frame.stream_id})")
+
+            # Map path to file system under doc_root
+            filepath = sanitize_path(doc_root, req_path)
+            if not filepath:
+                print(f"[!] 404 Not Found: {req_path}")
+                send_error_response(sock, stream_id=frame.stream_id, status_code=STATUS_NOT_FOUND, message="Resource not found")
+                continue
+
+            # Read file bytes
+            try:
+                with open(filepath, "rb") as f:
+                    file_bytes = f.read()
+            except Exception as e:
+                print(f"[!] 500 Error reading file {filepath}: {e}")
+                send_error_response(sock, stream_id=frame.stream_id, status_code=STATUS_INTERNAL_ERROR, message="File read error")
+                continue
+
+            mime_type, _ = mimetypes.guess_type(filepath)
+            if not mime_type:
+                mime_type = "application/octet-stream"
+
+            # Construct Response HEADERS frame
+            res_headers = [
+                (":status", str(STATUS_OK)),
+                ("content-type", mime_type),
+                ("content-length", str(len(file_bytes))),
+                ("server", "bserve/1.0"),
+            ]
+            encoded_hdr = encode_headers(res_headers)
+
+            resp_headers_frame = Frame(
+                type_=FRAME_TYPE_HEADERS,
+                flags=FLAG_END_HEADERS,
+                stream_id=frame.stream_id,
+                payload=encoded_hdr,
+            )
+
+            # Construct Response DATA frame
+            resp_data_frame = Frame(
+                type_=FRAME_TYPE_DATA,
+                flags=FLAG_END_STREAM,
+                stream_id=frame.stream_id,
+                payload=file_bytes,
+            )
+
+            write_frame(sock, resp_headers_frame)
+            write_frame(sock, resp_data_frame)
+            print(f"[+] Responded 200 OK ({len(file_bytes)} bytes served for {req_path})")
+            # Loop back to keep connection open for next request!
+    finally:
+        sock.close()
+
+
+def main():
+    doc_root = sys.argv[1] if len(sys.argv) > 1 else "./www"
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 9000
+
+    if not os.path.exists(doc_root):
+        os.makedirs(doc_root, exist_ok=True)
+
+    abs_doc_root = os.path.abspath(doc_root)
+    print(f"=== HTTP-in-Binary Server (bserve) ===")
+    print(f"[*] Document Root: {abs_doc_root}")
+    print(f"[*] Listening on port: {port}")
+
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_sock.bind(("0.0.0.0", port))
+    server_sock.listen(128)
+
+    try:
+        while True:
+            client_sock, addr = server_sock.accept()
+            t = threading.Thread(target=handle_client, args=(client_sock, addr, abs_doc_root), daemon=True)
+            t.start()
+    except KeyboardInterrupt:
+        print("\n[*] Server shutting down.")
+    finally:
+        server_sock.close()
+
+
+if __name__ == "__main__":
+    main()
