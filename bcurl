@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""
+bcurl - HTTP-in-Binary Client Implementation (Track 2)
+
+Usage:
+  ./bcurl [-v] <url>
+  Example: ./bcurl -v localhost:9000/index.html
+"""
+
+import sys
+import os
+import socket
+
+# Add local package directory to sys.path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from bproto import (
+    FRAME_TYPE_HEADERS,
+    FRAME_TYPE_DATA,
+    FLAG_END_STREAM,
+    FLAG_END_HEADERS,
+    Frame,
+    read_frame,
+    write_frame,
+    encode_headers,
+    decode_headers,
+)
+from bproto.utils import parse_url, format_hexdump
+
+
+def main():
+    args = sys.argv[1:]
+    verbose = False
+
+    if "-v" in args:
+        verbose = True
+        args.remove("-v")
+    if "--verbose" in args:
+        verbose = True
+        args.remove("--verbose")
+
+    if not args:
+        print("Usage: ./bcurl [-v] <url>", file=sys.stderr)
+        print("Example: ./bcurl -v localhost:9000/index.html", file=sys.stderr)
+        sys.exit(1)
+
+    url_arg = args[0]
+    host, port, path = parse_url(url_arg)
+
+    if verbose:
+        print(f"[*] Connecting to {host}:{port} for path '{path}'...", file=sys.stderr)
+
+    # 1. Connect over TCP socket (Single connection guarantee)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((host, port))
+    except Exception as e:
+        print(f"bcurl: Failed to connect to {host}:{port}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    # 2. Build Binary Request Frame
+    req_headers = [
+        (":method", "GET"),
+        (":path", path),
+        ("host", f"{host}:{port}"),
+        ("user-agent", "bcurl/1.0"),
+    ]
+    encoded_req_hdr = encode_headers(req_headers)
+
+    req_frame = Frame(
+        type_=FRAME_TYPE_HEADERS,
+        flags=FLAG_END_HEADERS | FLAG_END_STREAM,
+        stream_id=1,
+        payload=encoded_req_hdr,
+    )
+
+    if verbose:
+        req_bytes = req_frame.pack()
+        print(f"> Send HEADERS frame (Length: {req_frame.payload_length}, Flags: 0x{req_frame.flags:02x}, Stream: {req_frame.stream_id}):", file=sys.stderr)
+        print(format_hexdump(req_bytes, prefix="> "), file=sys.stderr)
+        print("> Headers sent:", file=sys.stderr)
+        for k, v in req_headers:
+            print(f">   {k}: {v}", file=sys.stderr)
+        print(file=sys.stderr)
+
+    # Send request frame
+    try:
+        write_frame(sock, req_frame)
+    except Exception as e:
+        print(f"bcurl: Error writing request frame: {e}", file=sys.stderr)
+        sock.close()
+        sys.exit(1)
+
+    # 3. Read Response Frames
+    status_code = 200
+    body_data = bytearray()
+    headers_received = False
+
+    try:
+        while True:
+            frame = read_frame(sock, skip_unknown=True)
+            if frame is None:
+                break
+
+            if verbose:
+                frame_bytes = frame.pack()
+                print(f"< Recv {frame.type_name} frame (Length: {frame.payload_length}, Flags: 0x{frame.flags:02x}, Stream: {frame.stream_id}):", file=sys.stderr)
+                print(format_hexdump(frame_bytes, prefix="< "), file=sys.stderr)
+
+            if frame.type == FRAME_TYPE_HEADERS:
+                headers_received = True
+                res_headers = decode_headers(frame.payload)
+                hdr_dict = dict(res_headers)
+                status_str = hdr_dict.get(":status", "200")
+                try:
+                    status_code = int(status_str)
+                except ValueError:
+                    status_code = 500
+
+                if verbose:
+                    print("< Response Headers:", file=sys.stderr)
+                    for k, v in res_headers:
+                        print(f"<   {k}: {v}", file=sys.stderr)
+                    print(file=sys.stderr)
+
+            elif frame.type == FRAME_TYPE_DATA:
+                body_data.extend(frame.payload)
+
+            # Check for END_STREAM flag
+            if frame.flags & FLAG_END_STREAM:
+                break
+
+    except Exception as e:
+        print(f"bcurl: Error reading response frames: {e}", file=sys.stderr)
+        sock.close()
+        sys.exit(1)
+    finally:
+        sock.close()
+
+    # 4. Write body payload to stdout
+    sys.stdout.buffer.write(body_data)
+    sys.stdout.buffer.flush()
+
+    # 5. Exit non-zero on 4xx / 5xx responses
+    if status_code >= 400:
+        if verbose:
+            print(f"\nbcurl: HTTP Error {status_code}", file=sys.stderr)
+        sys.exit(1)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
