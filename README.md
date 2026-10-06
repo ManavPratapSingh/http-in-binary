@@ -31,7 +31,6 @@ python3 tests/run_tests.py
 
 1. **[SPEC.md](file:///home/manav/garage/network/http-in-binary/SPEC.md)**: Two-page formal protocol specification (Frame header widths, HPACK-lite static header table, extension rules, and client/server constraints).
 2. **[HEXDUMP.md](file:///home/manav/garage/network/http-in-binary/HEXDUMP.md)**: Annotated byte-level hex dump of a complete binary request and response frame sequence.
-3. **[PROJECT_EXPLANATION.md](file:///home/manav/garage/network/http-in-binary/PROJECT_EXPLANATION.md)**: Deep-dive project explanation covering Problem Overview, System Architecture, Code Walkthrough, Execution Guide, and Viva Key Concepts.
 
 ---
 
@@ -57,6 +56,5 @@ http-in-binary/
 ├── bcurl                       # Track 2 Client executable script
 ├── SPEC.md                     # Formal 2-page Protocol Specification
 ├── HEXDUMP.md                  # Annotated Request/Response Hex Dump
-├── PROJECT_EXPLANATION.md      # Detailed Architecture & Code Walkthrough
 └── README.md                   # Repository Overview
 ```
